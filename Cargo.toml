@@ -1,0 +1,22 @@
+[package]
+name = "rust-aec"
+version = "0.1.0"
+edition = "2024"
+
+description = "Pure Rust decoder for CCSDS 121.0-B-3 Adaptive Entropy Coding (AEC), focused on GRIB2 template 5.0=42."
+readme = "README.md"
+rust-version = "1.85"
+
+license = "MIT"
+repository = "https://github.com/hkwk/rust-aec"
+homepage = "https://github.com/hkwk/rust-aec"
+documentation = "https://docs.rs/rust-aec"
+
+keywords = ["ccsds", "aec", "entropy", "compression", "grib2"]
+categories = ["compression"]
+
+[dependencies]
+bitflags = "2"
+
+[dev-dependencies]
+anyhow = "1"
