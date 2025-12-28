@@ -4,8 +4,8 @@ use rust_aec::{decode, flags_from_grib2_ccsds_flags};
 use rust_aec::params::AecParams;
 
 fn repo_root() -> PathBuf {
-    // crates/rust-aec/tests -> crates/rust-aec -> crates -> repo root
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("..").canonicalize().unwrap()
+    // Standalone crate: `CARGO_MANIFEST_DIR` is the repo root.
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).canonicalize().unwrap()
 }
 
 #[test]

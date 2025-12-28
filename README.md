@@ -6,6 +6,10 @@ This crate was created to avoid native `libaec` build friction (C/CMake/bindgen)
 
 Repository: https://github.com/hkwk/rust-aec
 
+Documentation (English): `docs/README.md`
+
+See `CHANGELOG.md` for recent changes and release notes.
+
 ## Visual comparison
 
 | rust-aec | libaec |
@@ -75,3 +79,10 @@ MIT. See `LICENSE`.
 ## Related
 
 - The host workspace includes a GRIB2 preview integration that can fall back to `rust-aec` for template 42.
+
+## Vendored reference code
+
+This repository may contain vendored third-party sources under `vendor/` (e.g. `libaec-sys`/`libaec`) for local reference and oracle comparisons.
+
+- These vendored directories are **excluded from crates.io packages** via `Cargo.toml` `exclude`.
+- `rust-aec` itself remains a **pure Rust** implementation.

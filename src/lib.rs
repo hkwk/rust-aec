@@ -26,6 +26,8 @@ pub mod params;
 pub use crate::error::AecError;
 pub use crate::params::{AecFlags, AecParams};
 
+pub use crate::decoder::{DecodeStatus, Decoder, Flush};
+
 /// Decode an AEC bitstream into packed sample bytes.
 ///
 /// - `input`: CCSDS/AEC payload bitstream.

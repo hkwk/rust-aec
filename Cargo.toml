@@ -1,6 +1,6 @@
 [package]
 name = "rust-aec"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 
 description = "Pure Rust decoder for CCSDS 121.0-B-3 Adaptive Entropy Coding (AEC), focused on GRIB2 template 5.0=42."
@@ -14,6 +14,14 @@ documentation = "https://docs.rs/rust-aec"
 
 keywords = ["ccsds", "aec", "entropy", "compression", "grib2"]
 categories = ["compression"]
+
+# Keep repository vendored sources out of crates.io packages.
+# They are for local reference/oracle comparison only.
+exclude = [
+	"/vendor/**",
+	"/target/**",
+	"/docs/**",
+]
 
 [dependencies]
 bitflags = "2"

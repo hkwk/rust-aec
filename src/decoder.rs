@@ -2,6 +2,620 @@ use crate::bitreader::BitReader;
 use crate::error::AecError;
 use crate::params::{AecFlags, AecParams};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Flush {
+    /// Like `AEC_NO_FLUSH`: decoding may continue once more input is provided.
+    NoFlush,
+    /// Like `AEC_FLUSH`: the caller asserts no more input will be provided.
+    Flush,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecodeStatus {
+    /// More input is required to make progress.
+    NeedInput,
+    /// The output buffer was filled; provide more output space to continue.
+    NeedOutput,
+    /// Finished decoding `output_samples`.
+    Finished,
+}
+
+/// Streaming AEC decoder (Rust-idiomatic, modeled after libaec's `aec_stream`).
+///
+/// This type allows chunked input and chunked output:
+///
+/// - call [`Decoder::push_input`] to append more bytes
+/// - call [`Decoder::decode`] to write decoded bytes into a caller buffer
+///
+/// Notes:
+/// - Output is **packed sample bytes** (same as [`decode_into`]).
+/// - You must know `output_samples` up front (same as one-shot API).
+pub struct Decoder {
+    params: AecParams,
+    bytes_per_sample: usize,
+    id_len: usize,
+    preprocess: bool,
+
+    output_samples: usize,
+    samples_written: usize,
+
+    // Predictor state (only used with preprocessing enabled).
+    predictor_x: Option<i64>,
+    sample_index_within_rsi: u64,
+    block_index_within_rsi: u32,
+
+    // Input bitstream.
+    reader: StreamBitReader,
+
+    // Pending output from a partially-flushed decoded block.
+    pending: Vec<u8>,
+    pending_pos: usize,
+
+    // Pending repeated coded values (used for zero-run etc.).
+    pending_repeat: Option<PendingRepeat>,
+
+    total_in: usize,
+    total_out: usize,
+}
+
+#[derive(Debug, Clone)]
+struct PendingRepeat {
+    coded_value: u32,
+    remaining: usize,
+}
+
+impl Decoder {
+    pub fn new(params: AecParams, output_samples: usize) -> Result<Self, AecError> {
+        validate_params(params)?;
+        let bytes_per_sample = bytes_per_sample(params)?;
+        let id_len = id_len(params)?;
+
+        Ok(Self {
+            params,
+            bytes_per_sample,
+            id_len,
+            preprocess: params.flags.contains(AecFlags::DATA_PREPROCESS),
+            output_samples,
+            samples_written: 0,
+            predictor_x: None,
+            sample_index_within_rsi: 0,
+            block_index_within_rsi: 0,
+            reader: StreamBitReader::new(),
+            pending: Vec::new(),
+            pending_pos: 0,
+            pending_repeat: None,
+            total_in: 0,
+            total_out: 0,
+        })
+    }
+
+    /// Append more bytes to the input buffer.
+    pub fn push_input(&mut self, input: &[u8]) {
+        self.reader.push(input);
+    }
+
+    /// Total number of input bytes consumed so far.
+    pub fn total_in(&self) -> usize {
+        self.total_in
+    }
+
+    /// Total number of output bytes produced so far.
+    pub fn total_out(&self) -> usize {
+        self.total_out
+    }
+
+    /// Bytes currently buffered and available for reading.
+    pub fn avail_in(&self) -> usize {
+        self.reader.avail_bytes()
+    }
+
+    /// Decode into `out` and return (written_bytes, status).
+    pub fn decode(&mut self, out: &mut [u8], flush: Flush) -> Result<(usize, DecodeStatus), AecError> {
+        if self.samples_written >= self.output_samples {
+            return Ok((0, DecodeStatus::Finished));
+        }
+
+        let mut written: usize = 0;
+
+        // Fast-path: flush any pending bytes first.
+        written += self.flush_pending(out, written);
+        if written >= out.len() {
+            self.total_out += written;
+            return Ok((written, DecodeStatus::NeedOutput));
+        }
+
+        // Then flush any pending repeat-run.
+        if let Some(status) = self.flush_repeat(out, &mut written)? {
+            self.total_out += written;
+            return Ok((written, status));
+        }
+
+        // Decode blocks/runs until output is full or decoding completes.
+        while written < out.len() {
+            if self.samples_written >= self.output_samples {
+                self.total_out += written;
+                return Ok((written, DecodeStatus::Finished));
+            }
+
+            // Ensure predictor state is reset at RSI boundary when preprocessing is enabled.
+            if self.preprocess && self.block_index_within_rsi == 0 {
+                self.predictor_x = None;
+            }
+
+            // If we don't have enough input to decode the next unit, request more.
+            let snapshot = self.snapshot();
+            match self.decode_next_unit() {
+                Ok(()) => {
+                    // Compaction: count consumed whole bytes.
+                    let consumed = self.reader.compact_consumed_bytes();
+                    self.total_in += consumed;
+
+                    // Flush any newly produced pending output/repeat.
+                    written += self.flush_pending(out, written);
+                    if written >= out.len() {
+                        self.total_out += written;
+                        return Ok((written, DecodeStatus::NeedOutput));
+                    }
+
+                    if let Some(status) = self.flush_repeat(out, &mut written)? {
+                        self.total_out += written;
+                        return Ok((written, status));
+                    }
+
+                    // Otherwise, loop and decode more.
+                }
+                Err(AecError::UnexpectedEof { .. }) | Err(AecError::UnexpectedEofDuringDecode { .. }) => {
+                    // Restore state and request more input unless flushing.
+                    self.restore(snapshot);
+                    self.total_out += written;
+                    return match flush {
+                        Flush::NoFlush => Ok((written, DecodeStatus::NeedInput)),
+                        Flush::Flush => Err(AecError::UnexpectedEofDuringDecode {
+                            bit_pos: self.reader.bits_read_total(),
+                            samples_written: self.samples_written,
+                        }),
+                    };
+                }
+                Err(e) => {
+                    self.restore(snapshot);
+                    return Err(e);
+                }
+            }
+        }
+
+        self.total_out += written;
+        Ok((written, DecodeStatus::NeedOutput))
+    }
+
+    fn flush_pending(&mut self, out: &mut [u8], written: usize) -> usize {
+        if self.pending_pos >= self.pending.len() {
+            self.pending.clear();
+            self.pending_pos = 0;
+            return 0;
+        }
+
+        let available = out.len().saturating_sub(written);
+        let remaining = self.pending.len().saturating_sub(self.pending_pos);
+        let to_copy = available.min(remaining);
+
+        out[written..written + to_copy]
+            .copy_from_slice(&self.pending[self.pending_pos..self.pending_pos + to_copy]);
+        self.pending_pos += to_copy;
+        to_copy
+    }
+
+    fn flush_repeat(&mut self, out: &mut [u8], written: &mut usize) -> Result<Option<DecodeStatus>, AecError> {
+        let Some(rep) = self.pending_repeat.as_mut() else {
+            return Ok(None);
+        };
+
+        while *written < out.len() && rep.remaining > 0 {
+            if self.samples_written >= self.output_samples {
+                self.pending_repeat = None;
+                return Ok(Some(DecodeStatus::Finished));
+            }
+
+            // Write exactly one sample (packed bytes).
+            let out_start = *written;
+            let out_end = out_start + self.bytes_per_sample;
+            if out_end > out.len() {
+                return Ok(Some(DecodeStatus::NeedOutput));
+            }
+
+            // Use the same semantics as emit_coded_value(): preprocessing applies here.
+            let mut tmp = OutBuf::new(&mut out[out_start..out_end], self.bytes_per_sample);
+            tmp.pos = 0;
+            emit_coded_value(
+                &mut tmp,
+                &mut self.predictor_x,
+                self.params,
+                self.bytes_per_sample,
+                rep.coded_value,
+                &mut self.sample_index_within_rsi,
+                usize::MAX,
+            )?;
+            *written += self.bytes_per_sample;
+            self.samples_written += 1;
+            rep.remaining -= 1;
+        }
+
+        if rep.remaining == 0 {
+            self.pending_repeat = None;
+        }
+
+        if *written >= out.len() {
+            return Ok(Some(DecodeStatus::NeedOutput));
+        }
+        Ok(None)
+    }
+
+    fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            predictor_x: self.predictor_x,
+            sample_index_within_rsi: self.sample_index_within_rsi,
+            block_index_within_rsi: self.block_index_within_rsi,
+            samples_written: self.samples_written,
+            reader: self.reader.clone(),
+            pending: self.pending.clone(),
+            pending_pos: self.pending_pos,
+            pending_repeat: self.pending_repeat.clone(),
+        }
+    }
+
+    fn restore(&mut self, s: Snapshot) {
+        self.predictor_x = s.predictor_x;
+        self.sample_index_within_rsi = s.sample_index_within_rsi;
+        self.block_index_within_rsi = s.block_index_within_rsi;
+        self.samples_written = s.samples_written;
+        self.reader = s.reader;
+        self.pending = s.pending;
+        self.pending_pos = s.pending_pos;
+        self.pending_repeat = s.pending_repeat;
+    }
+
+    fn decode_next_unit(&mut self) -> Result<(), AecError> {
+        // Ensure no pending bytes: we decode one unit into pending.
+        if self.pending_pos < self.pending.len() {
+            return Ok(());
+        }
+
+        // Build a small output buffer for a single block.
+        let mut block_out: Vec<u8> = vec![0u8; self.bytes_per_sample * (self.params.block_size as usize)];
+        let mut out = OutBuf::new(&mut block_out, self.bytes_per_sample);
+
+        // Start-of-RSI predictor reset.
+        if self.preprocess && self.block_index_within_rsi == 0 {
+            self.predictor_x = None;
+        }
+
+        let at_rsi_start = self.preprocess && self.block_index_within_rsi == 0;
+        let ref_pending = at_rsi_start;
+        let mut reference_sample_consumed = false;
+
+        // Read block option id.
+        let id = self.reader.read_bits_u32(self.id_len)?;
+        let max_id = (1u32 << self.id_len) - 1;
+
+        // Helper to consume the RSI reference sample.
+        let mut consume_reference = |this: &mut Self, out: &mut OutBuf<'_>| -> Result<(), AecError> {
+            let ref_raw = this.reader.read_bits_u32(this.params.bits_per_sample as usize)?;
+            let ref_val = if this.params.flags.contains(AecFlags::DATA_SIGNED) {
+                sign_extend(ref_raw, this.params.bits_per_sample)
+            } else {
+                ref_raw as i64
+            };
+            write_sample(out, ref_val, this.params)?;
+            this.predictor_x = Some(ref_val);
+            reference_sample_consumed = true;
+            this.sample_index_within_rsi += 1;
+            Ok(())
+        };
+
+        let remaining_total_samples = self.output_samples.saturating_sub(self.samples_written);
+        let max_samples_this_block = (self.params.block_size as usize).min(remaining_total_samples);
+
+        if id == 0 {
+            // Low-entropy family.
+            let selector = self.reader.read_bit()?;
+
+            // For low-entropy blocks, selector comes before optional RSI reference.
+            if ref_pending {
+                consume_reference(self, &mut out)?;
+                self.samples_written += 1;
+            }
+
+            // Remaining capacity after the optional reference sample.
+            let remaining_total_samples = self.output_samples.saturating_sub(self.samples_written);
+
+            let mut remaining_in_block = self.params.block_size as usize;
+            if reference_sample_consumed {
+                remaining_in_block = remaining_in_block.saturating_sub(1);
+            }
+
+            if !selector {
+                // Zero-block run: do not materialize huge output; schedule repeats.
+                let fs = read_unary_stream(&mut self.reader)?;
+                let mut z_blocks = fs + 1;
+                const ROS: u32 = 5;
+                if z_blocks == ROS {
+                    let b = self.block_index_within_rsi;
+                    let fill1 = self.params.rsi.saturating_sub(b);
+                    let fill2 = 64u32.saturating_sub(b % 64);
+                    z_blocks = fill1.min(fill2);
+                } else if z_blocks > ROS {
+                    z_blocks = z_blocks.saturating_sub(1);
+                }
+
+                let mut zeros_samples = (z_blocks as usize)
+                    .checked_mul(self.params.block_size as usize)
+                    .ok_or(AecError::InvalidInput("zero-run overflow"))?;
+                if reference_sample_consumed {
+                    zeros_samples = zeros_samples.saturating_sub(1);
+                }
+
+                // Limit to remaining total samples (reference already counted in `samples_written`).
+                zeros_samples = zeros_samples.min(remaining_total_samples);
+
+                // Emit any already-written reference sample into pending bytes.
+                let produced_len = out.len();
+                drop(out);
+                self.pending = block_out[..produced_len].to_vec();
+                self.pending_pos = 0;
+
+                // Schedule coded-value repeats (coded_value = 0).
+                if zeros_samples > 0 {
+                    self.pending_repeat = Some(PendingRepeat { coded_value: 0, remaining: zeros_samples });
+                }
+
+                // Advance block counter by z_blocks.
+                self.block_index_within_rsi = self.block_index_within_rsi.saturating_add(z_blocks);
+                if self.block_index_within_rsi >= self.params.rsi {
+                    self.block_index_within_rsi %= self.params.rsi;
+                    if self.params.flags.contains(AecFlags::PAD_RSI) {
+                        self.reader.align_to_byte();
+                    }
+                    self.sample_index_within_rsi = 0;
+                }
+
+                // We do not increment samples_written here; repeats are accounted for in flush.
+                return Ok(());
+            }
+
+            // Second Extension option.
+            let mut produced_samples = 0usize;
+            while remaining_in_block > 0 && produced_samples < max_samples_this_block.saturating_sub(reference_sample_consumed as usize) {
+                let m = read_unary_stream(&mut self.reader)?;
+                if m > 90 {
+                    return Err(AecError::InvalidInput("Second Extension unary symbol too large"));
+                }
+                let (a, b) = second_extension_pair(m);
+
+                // Emit up to two values.
+                if produced_samples < max_samples_this_block.saturating_sub(reference_sample_consumed as usize) {
+                    emit_coded_value(
+                        &mut out,
+                        &mut self.predictor_x,
+                        self.params,
+                        self.bytes_per_sample,
+                        a,
+                        &mut self.sample_index_within_rsi,
+                        usize::MAX,
+                    )?;
+                    produced_samples += 1;
+                    self.samples_written += 1;
+                }
+
+                if remaining_in_block > 0 {
+                    remaining_in_block = remaining_in_block.saturating_sub(1);
+                }
+                if produced_samples < max_samples_this_block.saturating_sub(reference_sample_consumed as usize) {
+                    emit_coded_value(
+                        &mut out,
+                        &mut self.predictor_x,
+                        self.params,
+                        self.bytes_per_sample,
+                        b,
+                        &mut self.sample_index_within_rsi,
+                        usize::MAX,
+                    )?;
+                    produced_samples += 1;
+                    self.samples_written += 1;
+                }
+                if remaining_in_block > 0 {
+                    remaining_in_block = remaining_in_block.saturating_sub(1);
+                }
+            }
+        } else if id == max_id {
+            // Uncompressed block.
+            if ref_pending {
+                consume_reference(self, &mut out)?;
+                self.samples_written += 1;
+            }
+
+            let mut remaining_in_block = self.params.block_size as usize;
+            if reference_sample_consumed {
+                remaining_in_block = remaining_in_block.saturating_sub(1);
+            }
+
+            for _ in 0..remaining_in_block {
+                if self.samples_written >= self.output_samples {
+                    break;
+                }
+                let v = self.reader.read_bits_u32(self.params.bits_per_sample as usize)?;
+                emit_coded_value(
+                    &mut out,
+                    &mut self.predictor_x,
+                    self.params,
+                    self.bytes_per_sample,
+                    v,
+                    &mut self.sample_index_within_rsi,
+                    usize::MAX,
+                )?;
+                self.samples_written += 1;
+            }
+        } else {
+            // Rice split.
+            let k = (id - 1) as usize;
+            if ref_pending {
+                consume_reference(self, &mut out)?;
+                self.samples_written += 1;
+            }
+
+            let mut remaining_in_block = self.params.block_size as usize;
+            if reference_sample_consumed {
+                remaining_in_block = remaining_in_block.saturating_sub(1);
+            }
+            let n = remaining_in_block.min(self.output_samples.saturating_sub(self.samples_written));
+            let mut tmp: Vec<u32> = vec![0u32; n];
+
+            for i in 0..n {
+                let q = read_unary_stream(&mut self.reader)?;
+                tmp[i] = (q as u32)
+                    .checked_shl(k as u32)
+                    .ok_or(AecError::InvalidInput("rice shift overflow"))?;
+            }
+            if k > 0 {
+                for i in 0..n {
+                    let rem = self.reader.read_bits_u32(k)?;
+                    tmp[i] |= rem;
+                }
+            }
+            for v in tmp {
+                if self.samples_written >= self.output_samples {
+                    break;
+                }
+                emit_coded_value(
+                    &mut out,
+                    &mut self.predictor_x,
+                    self.params,
+                    self.bytes_per_sample,
+                    v,
+                    &mut self.sample_index_within_rsi,
+                    usize::MAX,
+                )?;
+                self.samples_written += 1;
+            }
+        }
+
+        // Commit block output.
+        let produced_len = out.len();
+        drop(out);
+        self.pending = block_out[..produced_len].to_vec();
+        self.pending_pos = 0;
+
+        // Advance block counter.
+        self.block_index_within_rsi = self.block_index_within_rsi.saturating_add(1);
+        if self.preprocess && self.block_index_within_rsi >= self.params.rsi {
+            self.block_index_within_rsi = 0;
+            self.sample_index_within_rsi = 0;
+            if self.params.flags.contains(AecFlags::PAD_RSI) {
+                self.reader.align_to_byte();
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct Snapshot {
+    predictor_x: Option<i64>,
+    sample_index_within_rsi: u64,
+    block_index_within_rsi: u32,
+    samples_written: usize,
+    reader: StreamBitReader,
+    pending: Vec<u8>,
+    pending_pos: usize,
+    pending_repeat: Option<PendingRepeat>,
+}
+
+/// Streaming-capable bit reader backed by an internal buffer.
+///
+/// It allows appending input incrementally and compacting consumed bytes.
+#[derive(Debug, Clone)]
+struct StreamBitReader {
+    buf: Vec<u8>,
+    bit_pos: usize,
+    total_bytes_dropped: usize,
+}
+
+impl StreamBitReader {
+    fn new() -> Self {
+        Self { buf: Vec::new(), bit_pos: 0, total_bytes_dropped: 0 }
+    }
+
+    fn push(&mut self, data: &[u8]) {
+        self.buf.extend_from_slice(data);
+    }
+
+    fn avail_bytes(&self) -> usize {
+        self.buf.len().saturating_sub(self.bit_pos / 8)
+    }
+
+    fn bits_read_total(&self) -> usize {
+        self.total_bytes_dropped * 8 + self.bit_pos
+    }
+
+    fn align_to_byte(&mut self) {
+        let rem = self.bit_pos % 8;
+        if rem != 0 {
+            self.bit_pos += 8 - rem;
+        }
+    }
+
+    fn read_bit(&mut self) -> Result<bool, AecError> {
+        Ok(self.read_bits_u32(1)? != 0)
+    }
+
+    fn read_bits_u32(&mut self, nbits: usize) -> Result<u32, AecError> {
+        if nbits == 0 {
+            return Ok(0);
+        }
+        if nbits > 32 {
+            return Err(AecError::InvalidInput("read_bits_u32 supports up to 32 bits"));
+        }
+
+        let mut out: u32 = 0;
+        for _ in 0..nbits {
+            let byte_idx = self.bit_pos / 8;
+            let bit_in_byte = self.bit_pos % 8;
+            let byte = *self
+                .buf
+                .get(byte_idx)
+                .ok_or(AecError::UnexpectedEof { bit_pos: self.bits_read_total() })?;
+            let bit = (byte >> (7 - bit_in_byte)) & 1;
+            out = (out << 1) | (bit as u32);
+            self.bit_pos += 1;
+        }
+        Ok(out)
+    }
+
+    fn compact_consumed_bytes(&mut self) -> usize {
+        let bytes = self.bit_pos / 8;
+        if bytes == 0 {
+            return 0;
+        }
+        self.buf.drain(0..bytes);
+        self.bit_pos -= bytes * 8;
+        self.total_bytes_dropped += bytes;
+        bytes
+    }
+}
+
+fn read_unary_stream(r: &mut StreamBitReader) -> Result<u32, AecError> {
+    let mut count: u32 = 0;
+    loop {
+        let bit = r.read_bit()?;
+        if bit {
+            return Ok(count);
+        }
+        count = count.saturating_add(1);
+        if count > 1_000_000 {
+            return Err(AecError::InvalidInput("unary run too long"));
+        }
+    }
+}
+
 struct OutBuf<'a> {
     buf: &'a mut [u8],
     pos: usize,
